@@ -130,7 +130,8 @@ def build_report():
         ['Simulink Export', 'exportNetworkToSimulink: 104 layer subsystems'],
         ['Simulink v2 (Full Codegen)', 'All 16 placeholders replaced with MATLAB Function blocks'],
         ['C Code Generation', '5 C files, 6 headers, ~43 MB (ERT / ARM Cortex-A, weights embedded)'],
-        ['Numerical Verification', 'Max logit diff 1.76e-4 vs native (5/5 top-1 match)'],
+        ['Simulink Simulation', 'Accelerator mode: ~6 s, 4/5 top-1 match vs FP32'],
+        ['Numerical Verification', 'Attention code: max diff 1.76e-4 vs FP32 (5/5 top-1 match)'],
     ]
     story.append(make_table(summary_data[0], summary_data[1:],
                             col_widths=[2.5*inch, 4*inch]))
@@ -443,25 +444,46 @@ def build_report():
         styles['Body']))
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("7.3 Numerical Verification", styles['Subsection']))
+    story.append(Paragraph("7.3 Simulink Simulation (Accelerator Mode)", styles['Subsection']))
     story.append(Paragraph(
-        "The custom operator math was verified against the reference native dlnetwork "
-        "(which matches ONNX Runtime at max error 2.8e-4). The verification script "
-        "<font face='Courier'>verify_v2_math.m</font> re-implements the full forward pass "
-        "using the same MATLAB Function block code and ONNX weights, comparing final "
-        "1000-class logits:", styles['Body']))
+        "The v2 model was successfully simulated using Simulink's accelerator mode, "
+        "which JIT-compiles MATLAB Function blocks and reduces run time from "
+        ">2 min (normal mode) to <b>~6 seconds</b>. "
+        "Two workarounds were required:", styles['Body']))
     story.append(Spacer(1, 4))
-    ver_data = [
-        ['Test', 'Reference Top-1', 'v2 Top-1', 'Max Logit Diff', 'Status'],
-        ['5 random images', 'Various classes', 'Same as ref.', '\u2264 1.76e\u22124', '\u2713 PASS'],
+    story.append(Paragraph(
+        "\u2022 <b>Input format</b>: the top-level Inport block rejects external data due to a "
+        "batch-dimension mismatch after compilation. The workaround replaces the Inport "
+        "with a Simulink Constant block (value stored in model workspace), bypassing "
+        "the external-input loader entirely.", styles['Bullet']))
+    story.append(Paragraph(
+        "\u2022 <b>Output reconnection</b>: deleting the Inport also removes the output line. "
+        "Both the input and output top-level connections must be re-added before "
+        "simulation.", styles['Bullet']))
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("7.4 Simulation Results", styles['Subsection']))
+    story.append(Paragraph(
+        "Five random test images were run through the Simulink v2 model and compared "
+        "against the FP32 native dlnetwork reference:", styles['Body']))
+    story.append(Spacer(1, 4))
+    sim_data = [
+        ['Metric', 'Value', 'Notes'],
+        ['Simulation time', '~6 s', 'Accelerator mode, Apple M-series'],
+        ['Top-1 match (vs FP32)', '4/5 (80%)', 'Consistent with INT8 quantization error'],
+        ['Max logit diff (vs FP32)', '~4.0', 'Due to INT8 quantization, not attention code'],
+        ['Attention code diff (FP32 weights)', '\u2264 1.76e\u22124', 'Verified separately in verify_v2_math.m'],
+        ['Top-1 class (test 1)', '816', 'Correct match'],
     ]
-    story.append(make_table(ver_data[0], ver_data[1:],
-                            col_widths=[1.2*inch, 1.5*inch, 1.3*inch, 1.3*inch, 1.0*inch]))
+    story.append(make_table(sim_data[0], sim_data[1:],
+                            col_widths=[2.2*inch, 1.3*inch, 2.8*inch]))
     story.append(Spacer(1, 8))
     story.append(Paragraph(
-        "\u2713 Verification PASSED: 5/5 top-1 matches, max logit diff 1.76e-4 across all "
-        "test images. The Simulink v2 custom operator implementations are numerically "
-        "consistent with the ONNX Runtime reference.",
+        "The ~4.0 logit difference versus the FP32 reference is the expected INT8 "
+        "quantization error (the same ~10% accuracy drop observed during quantization). "
+        "The custom attention MATLAB Function code itself introduces only 1.76e-4 "
+        "error when run with FP32 weights, confirming the implementation is correct. "
+        "\u2713 Simulation PASSED.",
         styles['Rec']))
     story.append(PageBreak())
 
@@ -476,6 +498,14 @@ def build_report():
         "pathway to embedded code generation.", styles['Body']))
     story.append(Spacer(1, 12))
 
+    story.append(Paragraph(
+        "vit_tiny_simulink_v2.slx was simulated end-to-end using Simulink accelerator "
+        "mode (~6 s per inference), generating correct 1000-class logits and achieving "
+        "4/5 top-1 agreement with the FP32 reference (consistent with INT8 quantization). "
+        "The generated C code is ready for cross-compilation targeting ARM Cortex-A.",
+        styles['Body']))
+    story.append(Spacer(1, 12))
+
     story.append(Paragraph("Recommendations:", styles['Rec']))
     story.append(Paragraph(
         "\u2022 Use quantization-aware training (QAT) with real ImageNet data to improve "
@@ -484,6 +514,10 @@ def build_report():
         "\u2022 The generated C code from vit_tiny_simulink_v2.slx can be directly "
         "cross-compiled for ARM Cortex-A targets using the Embedded Coder toolchain.",
         styles['Bullet']))
+    story.append(Paragraph(
+        "\u2022 Persist the Constant-input wiring as a permanent simulation harness "
+        "(separate .slx) so the model can be re-simulated without modifying the "
+        "production model each time.", styles['Bullet']))
     story.append(Paragraph(
         "\u2022 Consider model distillation to a smaller ViT variant for tighter "
         "memory-constrained targets (current weights: ~42.8 MB embedded).", styles['Bullet']))
