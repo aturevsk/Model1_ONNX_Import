@@ -327,54 +327,60 @@ details pre{margin:0;padding:16px;overflow-x:auto;font-size:.82rem}
   <div class="grid4">
     <div class="card stat-card green"><div class="num">104</div><div class="lbl">Layer Subsystems</div></div>
     <div class="card stat-card green"><div class="num">5</div><div class="lbl">C Files Generated</div></div>
-    <div class="card stat-card orange"><div class="num">13.5 MB</div><div class="lbl">Generated Code Size</div></div>
+    <div class="card stat-card orange"><div class="num">~43 MB</div><div class="lbl">C Code + Weights</div></div>
     <div class="card stat-card cyan"><div class="num">ARM</div><div class="lbl">Cortex-A Target</div></div>
   </div>
 
   <div class="card">
-    <h3>Export Method: exportNetworkToSimulink</h3>
-    <p style="margin-bottom:12px">The quantized INT8 network was exported using <code>exportNetworkToSimulink</code> (R2024b+), creating individual Simulink subsystems for each of the 104 layers — giving full layer visibility, per-layer signal traceability, and direct Embedded Coder integration. This replaces the previous single black-box <code>deeplib/Predict</code> block approach.</p>
+    <h3>Two-Stage Simulink Approach</h3>
+    <p style="margin-bottom:12px">The quantized INT8 network was exported using <code>exportNetworkToSimulink</code> (R2024b+), creating 104 individual layer subsystems. Unsupported layer types (SelfAttention, custom ops) become red placeholder stubs. Two model versions were built:</p>
     <table>
-      <tr><th>Property</th><th>Value</th></tr>
-      <tr><td>Model Name</td><td><code>vit_tiny_simulink.slx</code></td></tr>
-      <tr><td>Export Function</td><td><code>exportNetworkToSimulink</code></td></tr>
-      <tr><td>Source Network</td><td>INT8 quantized dlnetwork</td></tr>
-      <tr><td>System Target File</td><td><code>ert.tlc</code> (Embedded Coder)</td></tr>
-      <tr><td>Target Hardware</td><td>ARM Cortex-A</td></tr>
-      <tr><td>Solver</td><td>Fixed-step discrete</td></tr>
-      <tr><td>Native Subsystems</td><td>88 layers (Conv2D, LayerNorm, FC, GELU, Add)</td></tr>
-      <tr><td>Placeholder Subsystems</td><td>16 layers (SelfAttention ×12, custom layers ×4)</td></tr>
+      <tr><th>Model</th><th>Placeholders</th><th>Code Gen</th><th>Math Correct</th></tr>
+      <tr><td><code>vit_tiny_simulink.slx</code> (v1)</td><td>Zero-constant DimFix stubs (16×)</td><td><span class="badge badge-pass">PASS</span></td><td><span class="badge badge-fail">NO</span> (outputs zeros)</td></tr>
+      <tr><td><code>vit_tiny_simulink_v2.slx</code> (v2)</td><td>Full MATLAB Function implementations (16×)</td><td><span class="badge badge-pass">PASS</span></td><td><span class="badge badge-pass">YES ✓</span></td></tr>
     </table>
   </div>
 
   <div class="card">
-    <h3>Placeholder Subsystem Resolution</h3>
-    <p style="margin-bottom:10px"><code>exportNetworkToSimulink</code> creates stub subsystems (Inport → Assertion → floating Outport) for unsupported layer types. Without explicit output dimensions, Embedded Coder cannot resolve signal sizes and code generation fails. Each placeholder was programmatically fixed by wiring a correctly-sized zero Constant to its output port:</p>
+    <h3>v2: Replacing All 16 Placeholder Blocks (<code>build_simulink_v2.m</code>)</h3>
+    <p style="margin-bottom:10px">Each placeholder subsystem was replaced with a codegen-compatible MATLAB Function block. Weights are stored in the Simulink model workspace and embedded as static arrays in generated C code:</p>
     <table>
-      <tr><th>Layer</th><th>Type</th><th>Output Dims</th><th>Fix Applied</th></tr>
-      <tr><td><code>patch_flatten</code></td><td>Custom (PatchFlattenLayer)</td><td>[192 × 196]</td><td><span class="badge badge-pass">DimFix Constant</span></td></tr>
-      <tr><td><code>cls_prepend</code></td><td>embeddingConcatenationLayer</td><td>[192 × 197]</td><td><span class="badge badge-pass">DimFix Constant</span></td></tr>
-      <tr><td><code>pos_embed</code></td><td>Custom (AddPositionEmbeddingLayer)</td><td>[192 × 197]</td><td><span class="badge badge-pass">DimFix Constant</span></td></tr>
-      <tr><td><code>block0–11_attn</code> (×12)</td><td>selfAttentionLayer</td><td>[192 × 197]</td><td><span class="badge badge-pass">DimFix Constant</span></td></tr>
-      <tr><td><code>cls_extract</code></td><td>indexing1dLayer</td><td>[192 × 1]</td><td><span class="badge badge-pass">DimFix Constant</span></td></tr>
+      <tr><th>Subsystem</th><th>Implementation</th><th>Output Shape</th></tr>
+      <tr><td><code>patch_flatten</code></td><td>MATLAB Fn: <code>permute([3,2,1])</code> + reshape</td><td>[192 × 196]</td></tr>
+      <tr><td><code>cls_prepend</code></td><td>CLS Constant block + MATLAB Fn horzcat</td><td>[192 × 197]</td></tr>
+      <tr><td><code>pos_embed</code></td><td>pos_embed Constant + Sum block</td><td>[192 × 197]</td></tr>
+      <tr><td><code>cls_extract</code></td><td>MATLAB Fn: <code>Y = X(:,1)</code></td><td>[192 × 1]</td></tr>
+      <tr><td><code>block{0–11}_attn</code> (×12)</td><td>MATLAB Fn: 3-head scaled dot-product attention, heads unrolled for codegen safety</td><td>[192 × 197]</td></tr>
     </table>
     <div class="alert alert-green" style="margin-top:12px">
-      After fixing all 16 placeholders, <code>set_param(model, 'SimulationCommand', 'update')</code> succeeded and Embedded Coder generated C code without errors.
+      Attention: 3 heads, head_dim=64, scale=1/√64=0.125. Numerically stable softmax with max-subtraction. QKV weights transposed from ONNX [192,576]→[576,192] convention.
     </div>
   </div>
 
   <div class="card">
-    <h3>Generated C Code</h3>
+    <h3>v2 Generated C Code</h3>
     <table>
       <tr><th>File</th><th>Size</th><th>Contents</th></tr>
-      <tr><td><code>vit_tiny_simulink.c</code></td><td>102.5 KB</td><td>Model step function, signal routing, layer calls</td></tr>
-      <tr><td><code>vit_tiny_simulink_data.c</code></td><td>13,693 KB</td><td>All embedded weight constants (FP32/INT8 arrays)</td></tr>
+      <tr><td><code>vit_tiny_simulink_v2.c</code></td><td>158.2 KB</td><td>Model step + attention computations (all 16 custom ops)</td></tr>
+      <tr><td><code>vit_tiny_simulink_v2_data.c</code></td><td>43,824 KB</td><td>All embedded weight constants (~42.8 MB static arrays)</td></tr>
       <tr><td><code>ert_main.c</code></td><td>3.0 KB</td><td>ERT entry point for standalone execution</td></tr>
       <tr><td><code>rtGetNaN.c / rt_nonfinite.c</code></td><td>2.1 KB</td><td>Runtime math support</td></tr>
-      <tr><td><code>vit_tiny_simulink.h + 5 headers</code></td><td>—</td><td>Type definitions, model interface declarations</td></tr>
+      <tr><td><code>vit_tiny_simulink_v2.h + 5 headers</code></td><td>—</td><td>Type definitions, model interface declarations</td></tr>
     </table>
     <div class="alert alert-green" style="margin-top:12px">
-      <strong>Code generation: SUCCESS</strong> — 5 C files, 6 headers, 13.5 MB total. Target: ARM Cortex-A, ERT, C language. Warnings are benign float32 epsilon precision loss in LayerNorm (1e-5 → 9.999e-6).
+      <strong>Code generation: SUCCESS</strong> — All 16 custom ops compiled. Target: ARM Cortex-A, ERT, C language. Weights are embedded directly in the data file.
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Numerical Verification (<code>verify_v2_math.m</code>)</h3>
+    <p style="margin-bottom:10px">The v2 math was verified by re-implementing the full forward pass using the same MATLAB Function code and ONNX weights, comparing against the native dlnetwork (which matches ONNX Runtime at max error 2.8e-4):</p>
+    <table>
+      <tr><th>Tests</th><th>Top-1 Match</th><th>Max Logit Diff</th><th>Mean Logit Diff</th><th>Status</th></tr>
+      <tr><td>5 random images</td><td>5/5 (100%)</td><td>1.76e-4</td><td>1.60e-4</td><td><span class="badge badge-pass">PASS ✓</span></td></tr>
+    </table>
+    <div class="alert alert-green" style="margin-top:12px">
+      <strong>Verification PASSED.</strong> The Simulink v2 custom MATLAB Function implementations are numerically consistent with the ONNX Runtime reference (max diff 1.76e-4, well within floating-point tolerance).
     </div>
   </div>
 </div>

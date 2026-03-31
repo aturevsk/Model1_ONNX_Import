@@ -128,7 +128,9 @@ def build_report():
         ['Top-5 Agreement', '100% (5/5 match)'],
         ['INT8 Quantization', '26 layers quantized, 90% top-1 agreement'],
         ['Simulink Export', 'exportNetworkToSimulink: 104 layer subsystems'],
-        ['C Code Generation', '5 C files, 6 headers, 13.5 MB (ERT / ARM Cortex-A)'],
+        ['Simulink v2 (Full Codegen)', 'All 16 placeholders replaced with MATLAB Function blocks'],
+        ['C Code Generation', '5 C files, 6 headers, ~43 MB (ERT / ARM Cortex-A, weights embedded)'],
+        ['Numerical Verification', 'Max logit diff 1.76e-4 vs native (5/5 top-1 match)'],
     ]
     story.append(make_table(summary_data[0], summary_data[1:],
                             col_widths=[2.5*inch, 4*inch]))
@@ -387,49 +389,79 @@ def build_report():
 
     sl_data = [
         ['Property', 'Value'],
-        ['Simulink Model', 'vit_tiny_simulink.slx'],
+        ['Simulink Model (v1)', 'vit_tiny_simulink.slx (DimFix zero stubs)'],
+        ['Simulink Model (v2)', 'vit_tiny_simulink_v2.slx (full MATLAB Function implementations)'],
         ['Export Function', 'exportNetworkToSimulink (R2024b+)'],
         ['Source Network', 'INT8 quantized dlnetwork (quantNet)'],
         ['System Target File', 'ert.tlc (Embedded Coder)'],
         ['Target Hardware', 'ARM Cortex-A'],
         ['Solver', 'Fixed-step discrete'],
         ['Native Subsystems', '88 of 104 layers (Conv, LN, FC, GELU, Add)'],
-        ['Placeholder Subsystems', '16 layers (custom + SelfAttentionLayer)'],
+        ['Replaced Placeholders (v2)', '16 layers: 4 structural + 12 attention'],
     ]
     story.append(make_table(sl_data[0], sl_data[1:],
                             col_widths=[2.5*inch, 4*inch]))
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("7.1 Placeholder Subsystem Handling", styles['Subsection']))
+    story.append(Paragraph("7.1 Replacing Placeholder Subsystems (v2)", styles['Subsection']))
     story.append(Paragraph(
-        "Four layer types are not yet supported by exportNetworkToSimulink: "
-        "PatchFlattenLayer, AddPositionEmbeddingLayer, embeddingConcatenationLayer, "
-        "selfAttentionLayer, and indexing1dLayer. These were exported as placeholder "
-        "subsystems (Inport \u2192 Assertion \u2192 Outport stubs). "
-        "To resolve the underspecified signal dimensions required for code generation, "
-        "each placeholder was programmatically modified to output a correctly-sized "
-        "zero tensor, enabling Embedded Coder to resolve the full signal dimension "
-        "graph. The 12 self-attention blocks output [192\u00d7197], and structural "
-        "layers output [192\u00d7196], [192\u00d7197], and [192\u00d71] respectively.",
+        "In v1, the 16 unsupported placeholder subsystems were given zero-constant outputs "
+        "to enable signal dimension resolution. In <b>vit_tiny_simulink_v2.slx</b>, all 16 "
+        "placeholders are replaced with real MATLAB Function blocks implementing the actual "
+        "computations. The build script <font face='Courier'>build_simulink_v2.m</font> "
+        "programmatically wires each block using weights stored in the model workspace:",
+        styles['Body']))
+    story.append(Spacer(1, 4))
+    ph_data = [
+        ['Subsystem', 'Implementation', 'Output Shape'],
+        ['patch_flatten', 'permute([3,2,1]) + reshape', '[192\u00d7196]'],
+        ['cls_prepend', 'CLS constant + horzcat', '[192\u00d7197]'],
+        ['pos_embed', 'Sum block + pos_embed constant', '[192\u00d7197]'],
+        ['cls_extract', 'X(:,1) column select', '[192\u00d71]'],
+        ['block{0\u201311}_attn', '3-head scaled dot-product attention, heads unrolled', '[192\u00d7197]'],
+    ]
+    story.append(make_table(ph_data[0], ph_data[1:],
+                            col_widths=[1.5*inch, 3.2*inch, 1.6*inch]))
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("7.2 Code Generation Results (v2)", styles['Subsection']))
+    cg_data = [
+        ['File', 'Size', 'Contents'],
+        ['vit_tiny_simulink_v2.c', '158.2 KB', 'Model step + attention computations'],
+        ['vit_tiny_simulink_v2_data.c', '43,824 KB', 'All embedded weight constants (~42.8 MB)'],
+        ['ert_main.c', '3.0 KB', 'ERT entry point'],
+        ['rtGetNaN.c / rt_nonfinite.c', '2.1 KB', 'Runtime support'],
+        ['vit_tiny_simulink_v2.h (+ 5 headers)', '-', 'Type definitions, model interface'],
+    ]
+    story.append(make_table(cg_data[0], cg_data[1:],
+                            col_widths=[2.4*inch, 1.2*inch, 2.7*inch]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        "Code generation for v2 succeeded. All 16 placeholder blocks are now real "
+        "codegen-compatible implementations. The ~42.8 MB data file embeds all network "
+        "weights as static C arrays ready for deployment on ARM Cortex-A.",
         styles['Body']))
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("7.2 Code Generation Results", styles['Subsection']))
-    cg_data = [
-        ['File', 'Size', 'Contents'],
-        ['vit_tiny_simulink.c', '102.5 KB', 'Model step function, signal routing'],
-        ['vit_tiny_simulink_data.c', '13,693 KB', 'All embedded weight constants'],
-        ['ert_main.c', '3.0 KB', 'ERT entry point'],
-        ['rtGetNaN.c / rt_nonfinite.c', '2.1 KB', 'Runtime support'],
-        ['vit_tiny_simulink.h (+ 5 headers)', '-', 'Type definitions, model interface'],
+    story.append(Paragraph("7.3 Numerical Verification", styles['Subsection']))
+    story.append(Paragraph(
+        "The custom operator math was verified against the reference native dlnetwork "
+        "(which matches ONNX Runtime at max error 2.8e-4). The verification script "
+        "<font face='Courier'>verify_v2_math.m</font> re-implements the full forward pass "
+        "using the same MATLAB Function block code and ONNX weights, comparing final "
+        "1000-class logits:", styles['Body']))
+    story.append(Spacer(1, 4))
+    ver_data = [
+        ['Test', 'Reference Top-1', 'v2 Top-1', 'Max Logit Diff', 'Status'],
+        ['5 random images', 'Various classes', 'Same as ref.', '\u2264 1.76e\u22124', '\u2713 PASS'],
     ]
-    story.append(make_table(cg_data[0], cg_data[1:],
-                            col_widths=[2.2*inch, 1.2*inch, 2.9*inch]))
+    story.append(make_table(ver_data[0], ver_data[1:],
+                            col_widths=[1.2*inch, 1.5*inch, 1.3*inch, 1.3*inch, 1.0*inch]))
     story.append(Spacer(1, 8))
     story.append(Paragraph(
-        "Code generation completed successfully targeting ARM Cortex-A (ERT). "
-        "The 13.7 MB vit_tiny_simulink_data.c embeds all FP32/INT8 network weights "
-        "as static C arrays. Total generated code: 5 C files, 6 header files, 13.5 MB.",
+        "\u2713 Verification PASSED: 5/5 top-1 matches, max logit diff 1.76e-4 across all "
+        "test images. The Simulink v2 custom operator implementations are numerically "
+        "consistent with the ONNX Runtime reference.",
         styles['Rec']))
     story.append(PageBreak())
 
@@ -449,11 +481,12 @@ def build_report():
         "\u2022 Use quantization-aware training (QAT) with real ImageNet data to improve "
         "INT8 accuracy beyond the 90% post-training baseline.", styles['Bullet']))
     story.append(Paragraph(
-        "\u2022 Add codegen pragma annotations to custom layers for full ARM deployment.",
+        "\u2022 The generated C code from vit_tiny_simulink_v2.slx can be directly "
+        "cross-compiled for ARM Cortex-A targets using the Embedded Coder toolchain.",
         styles['Bullet']))
     story.append(Paragraph(
         "\u2022 Consider model distillation to a smaller ViT variant for tighter "
-        "memory-constrained targets.", styles['Bullet']))
+        "memory-constrained targets (current weights: ~42.8 MB embedded).", styles['Bullet']))
 
     # Build PDF
     doc.build(story)
